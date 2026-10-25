@@ -7,7 +7,7 @@ using HarmonyLib;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LeadIndicator.LeadIndicatorMod), "提前量指示器", "1.7.0", "rhino2024")]
+[assembly: MelonInfo(typeof(LeadIndicator.LeadIndicatorMod), "提前量指示器", "1.7.4", "rhino2024")]
 [assembly: MelonGame("Radian Simulations LLC", "GHPC")]
 
 namespace LeadIndicator
@@ -22,6 +22,27 @@ namespace LeadIndicator
     //     NotifyAimOverride（游戏自己的「Aim Override」通道，会真的转动炮塔）。
     //     保留压制火控提前量（SuppressFcsLead）和自动校正距离（AutoRange）：这两条跟转不转炮无关，
     //     少了它们，画出来的圈就不是「压上去能打中」的那个点。
+    //
+    // 1.7.1：修进任务那一瞬每帧一抛的 NullReferenceException。PlayerInput.IsExteriorMode 直接读
+    //     _cameraManager 却不判空，而那个字段在任务初始化完成前还是 null；现在先用 FieldRef 读字段
+    //     判空，再问相机相关的属性（实测 00:16:16–00:16:21 五秒里抛了 620 次，每次都抓堆栈写日志）。
+    //
+    // 1.7.2：用户要求「自动提前量的自动改标尺默认设置为关」——AutoRange 默认从 true 改成 false。
+    //     它本来就是锁定后全自动改火控距离、没有任何按键；这里只是把默认值关掉，开关方式仍然只有
+    //     MelonPreferences.cfg 里改 AutoRange，不新增按键。
+    //
+    // 1.7.3：用户问「车体被挡住一半、只露上半车体时能不能也显示提前量」。原来只朝车体中心打一条
+    //     视线射线，中心在土坡后面就直接判看不见。现在中心看不见时再补采车体角点（Unit.Extremities），
+    //     任意一点通就算看得见——游戏自己的 AI 也是这么做的（VisibilityManager 那条 center 射线失败后
+    //     逐点重试 Extremities，all_ghpc.txt:215221-215262）。补采只在中心失败时发生，且 0.15 秒最多一次，
+    //     正常情况仍然是一条射线，不增加掉帧风险。
+    //
+    // 1.7.4：用户要求「根据玩家本身的标尺来出现提前量框框，比如用 400M 标尺就出现该标尺下打车的提前量」。
+    //     标尺＝炮镜 RangeText 显示的数字＝FCS.CurrentRange，也是游戏抬炮用的距离
+    //     （CompensatedWeaponVector 抬高 GetFallOfShot(ammo, _currentRange)）。标尺比真实距离短时，
+    //     炮弹到目标处已经沉到准星线下面 drop(D) - (D/R)*drop(R)；提前圈现在按这个量上抬/下压，
+    //     让「准星压到圈上」在这个标尺下仍然成立。标尺＝真实距离（打测距/开 AutoRange）时偏移为 0，与旧版一致。
+    //     新开关 RespectSightRange 默认 true，关掉退回只按真实距离画水平提前量。
     //
     // 1.6.1：Alt 是纯粹的开关（用户「按下alt是开，再按一次是关」）。以前按一下是「先解除、再按准星下
     //     那辆车重锁」，所以瞄着车永远关不掉；现在已开着时按一下一律解除，换目标就是关一下、挪准星、开一下。
@@ -49,7 +70,7 @@ namespace LeadIndicator
     {
         static MelonPreferences_Category cat;
         static MelonPreferences_Entry<bool> eEnabled, eShowBox, eShowCircle, eShowRange,
-            eSuppressLead, eAutoRange, eRequireVisible, eDebugLog;
+            eSuppressLead, eAutoRange, eRequireVisible, eSightRange, eDebugLog;
         static MelonPreferences_Entry<KeyCode> eToggle, eRangeKey;
         static MelonPreferences_Entry<float> eLockAngle, eMaxRange, eCircleRadius, eBoxPadding,
             eMinScreenRadius;
@@ -61,6 +82,8 @@ namespace LeadIndicator
 
         static AccessTools.FieldRef<GHPC.Weapons.FireControlSystem, bool> LeadLockRef;
         static AccessTools.FieldRef<GHPC.Weapons.FireControlSystem, Vector2> LeadRateRef;
+        // PlayerInput.IsExteriorMode 直接读 _cameraManager 却不判空，进任务那一瞬它还是 null
+        static AccessTools.FieldRef<GHPC.Player.PlayerInput, GHPC.Camera.CameraManager> CameraManagerRef;
 
         static StreamWriter log;
         static string noticeText = "";
@@ -122,8 +145,13 @@ namespace LeadIndicator
             eSuppressLead = cat.CreateEntry<bool>("SuppressFcsLead", true,
                 "锁定期间压掉火控自己的提前量。GHPC 的 FCS 是按你转镜头的角速度反推提前量的，"
                 + "不压掉的话，你把准星往我们画的圈上移，它会在圈上再加一份，变成双倍提前");
-            eAutoRange = cat.CreateEntry<bool>("AutoRange", true,
-                "锁定期间把火控距离校正到目标真实距离。没有激光测距仪的车靠这个才能直接打中");
+            eAutoRange = cat.CreateEntry<bool>("AutoRange", false,
+                "锁定期间自动把火控距离校正到目标真实距离（全自动，不占用任何按键）。默认关闭；"
+                + "打开后没有激光测距仪的车也能直接按圈打中");
+            eSightRange = cat.CreateEntry<bool>("RespectSightRange", true,
+                "按炮镜上显示的标尺（准星旁边那个 400/800…，即火控当前距离）来画提前圈。"
+                + "标尺比目标真实距离短时，圈会抬到「用这个标尺打」真正该瞄的位置（打远目标要抬着打）；"
+                + "标尺等于真实距离时和以前一样。关掉则只按真实距离画水平提前量，不管标尺");
             eLockAngle = cat.CreateEntry<float>("LockConeDegrees", 4f,
                 "按锁定键时，相机正前方多少度以内算“准星指着它”（角度越大越容易锁到旁边的车）");
             eMaxRange = cat.CreateEntry<float>("MaxRange", 6000f, "超过这个距离（米）的载具不锁定");
@@ -131,10 +159,10 @@ namespace LeadIndicator
                 "提前量小圈的半径（1080p 下的像素，高分屏会按比例放大）");
             eBoxPadding = cat.CreateEntry<float>("BoxPadding", 4f, "绿框比车体包围盒外扩多少像素");
             eRequireVisible = cat.CreateEntry<bool>("RequireLineOfSight", true,
-                "只锁视野里真看得见的目标。借用游戏 AI 自己那套判断（GHPC.AI.VisibilityManager.IsPositionVisible："
-                + "从炮镜往目标中心打射线，命中地形＝看不见，命中别的车的视准盒＝被挡住），"
+                "只锁视野里真看得见的目标。借用游戏 AI 自己那套判断（GHPC.AI.VisibilityManager.IsPositionVisible），"
+                + "先朝车体中心打一条射线；中心被挡（比如只露上半车体）时会补测车体角点，任意一处露出来就算看得见。"
                 + "所以山后面、树线后面那类「准星方向上恰好有一辆几公里外的车」不会再被锁上；"
-                + "顺带每帧复查，目标躲到山背后绿框就消失");
+                + "顺带每帧复查，目标整个躲到山背后绿框就消失");
             eMinScreenRadius = cat.CreateEntry<float>("MinScreenRadiusPixels", 12f,
                 "目标在屏幕上的尺寸门槛：拿游戏自己的车体可见性点位（Unit.Extremities，车体四角）量「中心到最远点」的"
                 + "像素半径，不足这个数就不锁定。远处的车在屏幕上只有几个像素，你肉眼认不出来，模组也不该替你锁；"
@@ -154,12 +182,24 @@ namespace LeadIndicator
                 MelonLogger.Warning("提前量指示器：找不到 FCS 的提前量字段，压制火控提前量失效：" + e.Message);
             }
 
+            try
+            {
+                CameraManagerRef = AccessTools.FieldRefAccess<GHPC.Player.PlayerInput,
+                    GHPC.Camera.CameraManager>("_cameraManager");
+            }
+            catch (Exception e)
+            {
+                CameraManagerRef = null;
+                MelonLogger.Warning("提前量指示器：找不到 PlayerInput._cameraManager，炮手就绪判断会退回逐帧 try/catch：" + e.Message);
+            }
+
             if (eDebugLog.Value) OpenLog();
             MelonLogger.Msg("提前量指示器 已加载（炮手镜里按 " + LockKeyName() + " 锁定，"
                 + eToggle.Value + " 开关，" + (eEnabled.Value ? "现在是开的" : "现在是关的") + "）");
-            Log("LeadIndicator 1.7.0 initialised, enabled=" + eEnabled.Value
+            Log("LeadIndicator 1.7.4 initialised, enabled=" + eEnabled.Value
                 + " lock key=" + LockKeyName() + " toggle=" + eToggle.Value
                 + " suppress fcs lead=" + eSuppressLead.Value + " auto range=" + eAutoRange.Value
+                + " respect sight range=" + eSightRange.Value
                 + " cone=" + eLockAngle.Value + " max range=" + eMaxRange.Value);
         }
 
@@ -218,6 +258,10 @@ namespace LeadIndicator
         // 都会顺手把目标锁上或解掉。改成“抬起时结算”：Alt 抬起的这一刻，只有全程没碰过其它键才算单按。
         static bool altIsDown;
         static bool altWasCombined;
+
+        // 中心射线失败后，车体角点补采的结果与下一次重测时间（见 GameCanSee）
+        static float losRetryTime;
+        static bool losPartial;
 
         static readonly KeyCode[] KeysThatCancelTap =
         {
@@ -341,6 +385,9 @@ namespace LeadIndicator
             }
 
             target = best;
+            // 锁定循环给每个候选都做了 force 检查，缓存里留的是最后一个候选的结果，必须作废
+            losRetryTime = 0f;
+            losPartial = false;
             lockedPlayer = own;
             try
             {
@@ -365,7 +412,7 @@ namespace LeadIndicator
         // 几公里外的目标在屏幕上只有几个像素，四度锥照样把它算进“准星指着它”。这两道门槛把“看得见”补回来。
         static string RejectReason(Camera cam, GHPC.Unit own, GHPC.Unit u, Vector3 centre)
         {
-            if (eRequireVisible.Value && !GameCanSee(own, cam.transform.position, u, centre))
+            if (eRequireVisible.Value && !GameCanSee(own, cam.transform.position, u, centre, true))
                 return "被地形或别的车挡住、视野里看不见";
 
             float min = eMinScreenRadius.Value;
@@ -386,24 +433,43 @@ namespace LeadIndicator
         // （grassBlocks=true, terrainCheckOnly=false, skipTreesAndSmoke=false, treatTreesAsOpaque=false）。
         // 炮镜相机在自己车体的视准盒里面，Unity 默认 queriesHitBackfaces=false，从内部出发的射线不会打到自己，
         // 所以这条射线天然不会被玩家自己的车挡掉（游戏 AI 也是这么用的）。
-        static bool GameCanSee(GHPC.Unit own, Vector3 from, GHPC.Unit wanted, Vector3 to)
+        // 中心射线 + 车体角点补采：只露上半车体时中心在土坡后面，但车体上缘还看得见。
+        // 游戏自己的 AI 在中心看不见时也是逐点重试 Unit.Extremities（all_ghpc.txt:215221-215262）。
+        // 补采只在中心失败时发生，且 0.15 秒最多一次，正常情况仍然只有一条射线。
+        // force=true 给按下锁定键那一下用：结果必须属于正在判的这辆车，不能吃别的目标留下的缓存。
+        static bool GameCanSee(GHPC.Unit own, Vector3 from, GHPC.Unit wanted, Vector3 centre, bool force)
         {
             if (own == null) return true;
 
+            GHPC.Unit struck;
+            if (CastView(own, from, wanted, centre, out struck)) return true;
+
+            if (force || Time.unscaledTime >= losRetryTime)
+            {
+                losRetryTime = Time.unscaledTime + 0.15f;
+                losPartial = PartialVisible(own, from, wanted, centre);
+            }
+            if (losPartial)
+            {
+                LogOnce("LOS: centre blocked, hull edge visible - partial cover accepted");
+                return true;
+            }
+
+            Log("LOS rejected " + SafeName(wanted) + " at " + Vector3.Distance(from, centre).ToString("0")
+                + " m, blocker=" + (struck != null ? SafeName(struck) : "terrain or other collider"));
+            return false;
+        }
+
+        static bool CastView(GHPC.Unit own, Vector3 from, GHPC.Unit wanted, Vector3 to, out GHPC.Unit struck)
+        {
+            struck = null;
             float dist = Vector3.Distance(from, to);
             float max = dist + 25f;
             float penalty;
-            GHPC.Unit struck;
             try
             {
-                bool visible = GHPC.AI.VisibilityManager.IsPositionVisible(own, from, wanted, to,
+                return GHPC.AI.VisibilityManager.IsPositionVisible(own, from, wanted, to,
                     max, max * max, out penalty, out struck, true, false, false, false);
-                if (!visible)
-                {
-                    Log("LOS rejected " + SafeName(wanted) + " at " + dist.ToString("0")
-                        + " m, blocker=" + (struck != null ? SafeName(struck) : "terrain or other collider"));
-                }
-                return visible;
             }
             catch (Exception e)
             {
@@ -411,6 +477,35 @@ namespace LeadIndicator
                 LogOnce("visibility check threw: " + e.Message);
                 return true;
             }
+        }
+
+        static bool PartialVisible(GHPC.Unit own, Vector3 from, GHPC.Unit wanted, Vector3 centre)
+        {
+            List<Transform> pts = null;
+            try { pts = wanted.Extremities; } catch { pts = null; }
+
+            int rays = 0;
+            float highest = float.MinValue;
+            if (pts != null)
+            {
+                for (int i = 0; i < pts.Count && rays < 4; i++)
+                {
+                    var t = pts[i];
+                    if (t == null) continue;
+                    rays++;
+                    Vector3 p = t.position;
+                    if (p.y > highest) highest = p.y;
+                    GHPC.Unit struck;
+                    if (CastView(own, from, wanted, p, out struck)) return true;
+                }
+            }
+            // 角点都标在履带附近（或压根没有角点）时补测车顶，保证「只露上半车体」照样能用
+            if (rays == 0 || highest < centre.y + 0.3f)
+            {
+                GHPC.Unit struck;
+                if (CastView(own, from, wanted, centre + Vector3.up * 0.8f, out struck)) return true;
+            }
+            return false;
         }
 
         // 尺寸用游戏自己的车体可见性点位量（Unit.Extremities = 私有 VisibilityLocations，车体四角那一圈 transform），
@@ -443,9 +538,18 @@ namespace LeadIndicator
             pi = GHPC.Player.PlayerInput.Instance;
             if (pi == null) return false;
             if (GHPC.AarController.InAar) return false;
-            if (!pi.PlayerCanControlGunnerNow) return false;
-            if (pi.UsingBinoculars) return false;
-            if (pi.IsExteriorMode) return false;
+            try
+            {
+                if (!pi.PlayerCanControlGunnerNow) return false;
+                if (!CameraReady(pi)) return false;
+                if (pi.UsingBinoculars) return false;
+                if (pi.IsExteriorMode) return false;
+            }
+            catch (Exception e)
+            {
+                LogOnce("player state threw: " + e.Message);
+                return false;
+            }
             if (FullControlField != null && SeatField != null)
             {
                 try
@@ -457,6 +561,14 @@ namespace LeadIndicator
                 catch { return false; }
             }
             return MainCam() != null;
+        }
+
+        // 进任务、切车那一瞬 PlayerInput._cameraManager 还是 null：UsingBinoculars 自己判空，
+        // IsExteriorMode 不判，直接读就会每帧抛一个 NRE（实测 5 秒 620 次）
+        static bool CameraReady(GHPC.Player.PlayerInput pi)
+        {
+            if (CameraManagerRef == null) return true;   // 字段没绑上就交给调用处的 try/catch
+            return CameraManagerRef(pi) != null;
         }
 
         static bool StillValid(GHPC.Player.PlayerInput pi, Camera cam, out string why)
@@ -486,7 +598,7 @@ namespace LeadIndicator
             if (to.magnitude > eMaxRange.Value * 1.25f) { why = "target out of range"; return false; }
             if (Vector3.Angle(cam.transform.forward, to) > 35f) { why = "target left the view"; return false; }
             // 目标躲到山背后就该脱锁，绿框跟着消失，和“只锁视野里的”是同一条规矩
-            if (eRequireVisible.Value && !GameCanSee(pi.CurrentPlayerUnit, cam.transform.position, target, centre))
+            if (eRequireVisible.Value && !GameCanSee(pi.CurrentPlayerUnit, cam.transform.position, target, centre, false))
             { why = "target is behind cover"; return false; }
             return true;
         }
@@ -546,14 +658,21 @@ namespace LeadIndicator
             flight = FlightTime(ammo, Vector3.Distance(origin, lead));
             lead = centre + velocity * flight;
 
+            // 炮镜上的标尺（准星旁显示的 400/800…）就是游戏抬炮用的距离：标尺比真实距离短时，
+            // 炮弹到目标处已经沉到准星线下面，圈得按同一弹道往上抬，否则照着圈打会打低
+            float sightRange = 0f;
+            try { sightRange = fcs != null ? fcs.CurrentRange : 0f; } catch { sightRange = 0f; }
+            float holdover = eSightRange.Value ? SightHoldover(ammo, sightRange, distance) : 0f;
+            Vector3 aim = lead + Vector3.up * holdover;
+
             haveBox = ProjectBox(cam, out boxRect);
-            haveLead = haveBox && TryProject(cam, lead, out leadScreen);
+            haveLead = haveBox && TryProject(cam, aim, out leadScreen);
             // 圈离屏幕中心多少个像素：这是「按现在这套算法，屏幕上圈和准星差多远」的直接读数
             leadPixelOffset = haveLead
                 ? Vector2.Distance(leadScreen, new Vector2(Screen.width * 0.5f, Screen.height * 0.5f))
                 : -1f;
             viewErrorDeg = -1f;
-            try { viewErrorDeg = Vector3.Angle(cam.transform.forward, lead - cam.transform.position); } catch { }
+            try { viewErrorDeg = Vector3.Angle(cam.transform.forward, aim - cam.transform.position); } catch { }
 
             int metres = Mathf.RoundToInt(distance);
             if (metres != rangeInt)
@@ -562,7 +681,7 @@ namespace LeadIndicator
                 rangeText = metres + " m";
             }
 
-            LogThrottled(distance, flight, velocity.magnitude, fcs);
+            LogThrottled(distance, flight, velocity.magnitude, fcs, sightRange, holdover);
         }
 
         void ApplyRange(GHPC.Weapons.FireControlSystem fcs, float distance)
@@ -600,6 +719,30 @@ namespace LeadIndicator
                 if (mv > 1f) return range / mv;
             }
             return range / 1000f;
+        }
+
+        // 标尺补偿量（米，正值＝圈要抬高）。
+        // 炮镜上的标尺 R（FCS.CurrentRange，也是 UsableOptic.RangeText 显示的数字）就是游戏抬炮用的距离：
+        // CompensatedWeaponVector 里把炮口抬高 GetFallOfShot(ammo, _currentRange) 那么多。
+        // 于是炮口对准准星线时，炮弹走到目标距离 D 处已经相对准星线低了 drop(D) - (D/R)*drop(R)，
+        // 想让炮弹落在提前点上，准星线就得压在这个点上方同样的距离。
+        static float SightHoldover(AmmoType ammo, float sightRange, float distance)
+        {
+            if (ammo == null || sightRange < 10f || distance < 10f) return 0f;
+            try
+            {
+                var repo = GHPC.Weapons.BallisticComputerRepository.Instance;
+                if (repo == null) return 0f;
+                float fallSight = repo.GetFallOfShot(ammo, sightRange);
+                float fallTarget = repo.GetFallOfShot(ammo, distance);
+                float hold = fallTarget - (distance / sightRange) * fallSight;
+                return Mathf.Clamp(hold, -60f, 60f);
+            }
+            catch (Exception e)
+            {
+                LogOnce("fall of shot threw: " + e.Message);
+                return 0f;
+            }
         }
 
         // ---------------------------------------------------------------- fcs lead suppression
@@ -655,6 +798,8 @@ namespace LeadIndicator
             if (target != null) Log("release: " + why);
             RestoreLead();
             target = null;
+            losRetryTime = 0f;
+            losPartial = false;
             lockedPlayer = null;
             lockedWeapon = null;
             targetRenderers = null;
@@ -1151,7 +1296,8 @@ namespace LeadIndicator
             if (log != null) { try { log.Dispose(); } catch { } log = null; }
         }
 
-        void LogThrottled(float distance, float flight, float speed, GHPC.Weapons.FireControlSystem fcs)
+        void LogThrottled(float distance, float flight, float speed, GHPC.Weapons.FireControlSystem fcs,
+            float sightRange, float holdover)
         {
             if (!eDebugLog.Value) return;
             logTimer -= Time.unscaledDeltaTime;
@@ -1164,6 +1310,7 @@ namespace LeadIndicator
             try { if (fcs != null) stab = fcs.StabsActive ? "on" : "off"; } catch { }
             Log("target " + SafeName(target) + " dist=" + distance.ToString("0.0")
                 + " m fcs range=" + range + " flight=" + flight.ToString("0.00")
+                + " s sight=" + sightRange.ToString("0") + " m holdover=" + holdover.ToString("+0.0;-0.0;0.0")
                 + " s target speed=" + speed.ToString("0.0") + " m/s lead offset="
                 + (Mathf.Abs(speed) > 0.05f ? (speed * flight).ToString("0.0") + " m" : "0")
                 + (haveLead ? " circle on screen" : " circle off screen")

@@ -6,11 +6,13 @@ Gunner, HEAT, PC! 的 MelonLoader 模组。炮手镜里按一下 `Alt` 锁住准
 
 锁定之后，目标车体上有一个绿框，框下是距离，框和前面的小圆圈之间连一条绿线——那个小圆圈就是提前量：按游戏自己弹道表里的飞行时间算出来的落点。目标在动，圈也跟着走，每帧重算。
 
-锁定期间会做两件事让这个圈「压上去真能打中」：压住火控自己那份提前量（GHPC 的 FCS 是按你转镜头的角速度反推提前量的，不压掉的话，你把准星往圈上移，它会在圈上再加一份，变成双倍提前），以及把火控距离校正到真实距离（没有激光测距仪的车靠这一条才能直接打中）。解除锁定时原样还原。
+锁定期间会压住火控自己那份提前量：GHPC 的 FCS 是按你转镜头的角速度反推提前量的，不压掉的话，你把准星往圈上移，它会在圈上再加一份，变成双倍提前。解除锁定时原样还原。另外可以打开 `AutoRange`，锁定期间把火控距离校正到目标真实距离（没有激光测距仪的车靠这一条才能直接打中），默认关闭。
+
+**圈跟着你炮镜上的标尺走。** 标尺（准星旁显示的 400/800…）就是火控距离，游戏按它把炮身抬起，让弹道在那个距离穿过光轴。所以拿 400 m 标尺打 1000 m 的车，圈会抬到那个标尺下真正该瞄的位置，而不是一律按真实距离画一条水平提前量。标尺等于真实距离时（激光测距过、或 `AutoRange` 改好了距离）偏移为零，圈落回车上，和以前完全一样。
 
 **模组不会动你的炮口。** 1.7.0 把之前的自动跟踪整条去掉了：锁上之后炮塔不转、准星不跑，只画框、只画圈、只报距离；要不要往圈上压是你的操作。`Alt` 是纯粹的开关，开着的时候再按一下一律解除（不管准星下有没有车）。换目标就是按一下关、挪准星、再按一下开。
 
-只锁视野里真看得见的目标：借用游戏 AI 自己的视线判断，山后面、树线后面那类「准星方向上恰好有一辆几公里外的车」不会被锁上；锁着的时候目标躲进山背后，框也会消失。屏幕上一共只有几个像素的远车同样不锁——肉眼看不清的车，模组也不该替你锁。
+只锁视野里真看得见的目标：借用游戏 AI 自己的视线判断，山后面、树线后面那类「准星方向上恰好有一辆几公里外的车」不会被锁上；锁着的时候目标躲进山背后，框也会消失。屏幕上一共只有几个像素的远车同样不锁——肉眼看不清的车，模组也不该替你锁。车体被挡住一半、只露出上半截时照样能锁：中心那条视线被挡之后，模组会再去探车体四角，任意一点能看见就算看得见。
 
 没有激光测距仪的车，原版测距本来就用不了；锁定期间这一条替你把它补上。
 
@@ -35,13 +37,14 @@ Gunner, HEAT, PC! 的 MelonLoader 模组。炮手镜里按一下 `Alt` 锁住准
 | ShowLeadCircle | true | 绿线 + 提前量小圈 |
 | ShowRange | true | 绿框下面显示测出的距离 |
 | SuppressFcsLead | true | 锁定期间压掉火控自己的提前量，防双倍提前 |
-| AutoRange | true | 锁定期间把火控距离校正到目标真实距离 |
+| AutoRange | false | 锁定期间把火控距离校正到目标真实距离 |
 | LockConeDegrees | 4 | 准星正前方多少度以内算指着它，越大越容易锁到旁边的车 |
 | MaxRange | 6000 | 超过这个距离（米）不锁定 |
 | CircleRadius | 14 | 小圈半径（1080p 像素，高分屏按比例放大） |
 | BoxPadding | 4 | 绿框比车体包围盒外扩多少像素 |
 | RequireLineOfSight | true | 只锁视野里真看得见的目标 |
 | MinScreenRadiusPixels | 12 | 目标在屏幕上太小就不锁；填 0 关掉 |
+| RespectSightRange | true | 提前圈按炮镜标尺抬落；关掉则只按真实距离画水平提前量 |
 | DebugLog | false | 出问题再开，会写 `Bin\Mods\LeadIndicator.debug.log` |
 
 ## 先说清楚
@@ -62,6 +65,6 @@ GHPC_DIR="/path/to/Gunner HEAT PC/Bin" bash src/build.sh deploy
 
 ## In English
 
-Shows where to aim at a moving target instead of moving your gun for you. Tap `Alt` in the gunner sight to lock the enemy vehicle under the reticle: a green box appears around its hull, a line runs to a small circle marking the lead point computed from the game's own ballistic flight-time table, and the measured range is printed under the box. While locked, the mod suppresses the fire control's own lead (GHPC's FCS infers lead from your turret traverse rate, which would otherwise double it) and corrects the FCS range to the true range, restoring both on unlock. It only locks targets that are actually visible to the game's AI line-of-sight check and big enough on screen to be recognised. Version 1.7.0 removed the previous auto-tracking chain entirely: the turret is never driven, the mod only draws. `Alt` is a plain on/off toggle, `F4` toggles the whole mod.
+Shows where to aim at a moving target instead of moving your gun for you. Tap `Alt` in the gunner sight to lock the enemy vehicle under the reticle: a green box appears around its hull, a line runs to a small circle marking the lead point computed from the game's own ballistic flight-time table, and the measured range is printed under the box. While locked, the mod suppresses the fire control's own lead (GHPC's FCS infers lead from your turret traverse rate, which would otherwise double it), restores it on unlock, and can optionally correct the FCS range to the true range (`AutoRange`, off by default). It only locks targets that are actually visible to the game's AI line-of-sight check and big enough on screen to be recognised; if the centre line is blocked, the hull corners are probed, so a tank showing only its upper half still locks. The lead circle follows the sight's range dial: with the dial at 400 m and a target at 1000 m, the circle rises to the point you would actually hold for that setting, and it falls back to the plain horizontal lead when the dial matches the true range (or `RespectSightRange` is off). Version 1.7.0 removed the previous auto-tracking chain entirely: the turret is never driven, the mod only draws. `Alt` is a plain on/off toggle, `F4` toggles the whole mod.
 
 MIT，与 Radian Simulations 无关。在 0.1.0-alpha+20261014 上实测过，游戏更新有可能让它失效。
