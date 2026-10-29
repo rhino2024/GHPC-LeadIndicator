@@ -7,7 +7,7 @@ using HarmonyLib;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LeadIndicator.LeadIndicatorMod), "提前量指示器", "1.7.4", "rhino2024")]
+[assembly: MelonInfo(typeof(LeadIndicator.LeadIndicatorMod), "提前量指示器", "1.8.0", "rhino2024")]
 [assembly: MelonGame("Radian Simulations LLC", "GHPC")]
 
 namespace LeadIndicator
@@ -44,6 +44,21 @@ namespace LeadIndicator
     //     让「准星压到圈上」在这个标尺下仍然成立。标尺＝真实距离（打测距/开 AutoRange）时偏移为 0，与旧版一致。
     //     新开关 RespectSightRange 默认 true，关掉退回只按真实距离画水平提前量。
     //
+    // 1.8.0：用户要求「车长或队友报点后，自动在被报点的敌人身上画提前量框，最多三个；火控坏了这条自动
+    //     提前量就不能用」。报点来源是游戏自己的无线电网络（不是我们另建一套探测）：
+    //     GHPC.Unit.Radio → Radio.SpottingEntries（List<SpottingEvent>），每条的 Target.Unit 就是被报的那辆、
+    //     ExpiryTimestamp＝上报时刻（Time.timeSinceLevelLoad）＋90 秒。游戏自己小地图/HUD 上的报点标记读的就是
+    //     这一份（CommsTargetManager::RefreshCommsTargets 拿 PlayerInput.CurrentPlayerUnit.Radio.SpottingEntries，
+    //     用同一个时钟判过期，all_ghpc.txt:77098-77148），所以我们画的车和玩家「知道」的车天然一致。
+    //     位置一律取 Target.Unit 的实时 Center，不用 SpottingData.Position —— 那个字段是报点那一刻的快照，
+    //     车开走了它还留在原地。
+    //     画法是只画不动炮的叠加层：橙黄色框＋提前圈，和玩家自己按 Alt 锁的绿框分开、互不干扰，
+    //     也不写火控、不压火控提前量（SuppressFcsLead 只跟手动锁定走）。
+    //     火控门槛：ActiveWeapon.FCS.FcsFault（＝_computerInop＝计算机被打掉或没电）一真，整层立刻清空、
+    //     只提示一次；这条按用户要求实现的是「火控损坏＝这套自动提前量不给你用」，不是「坏了还照画」，
+    //     否则玩家会照着电脑给的圈打，而炮实际上根本没有弹道解算。
+    //     数量上限 SpotLeadMax 默认 3，同一时刻同一辆车只算一个框，超出上限留最近收到的报点。
+    //
     // 1.6.1：Alt 是纯粹的开关（用户「按下alt是开，再按一次是关」）。以前按一下是「先解除、再按准星下
     //     那辆车重锁」，所以瞄着车永远关不掉；现在已开着时按一下一律解除，换目标就是关一下、挪准星、开一下。
     //
@@ -70,8 +85,9 @@ namespace LeadIndicator
     {
         static MelonPreferences_Category cat;
         static MelonPreferences_Entry<bool> eEnabled, eShowBox, eShowCircle, eShowRange,
-            eSuppressLead, eAutoRange, eRequireVisible, eSightRange, eDebugLog;
+            eSuppressLead, eAutoRange, eRequireVisible, eSightRange, eSpotLead, eDebugLog;
         static MelonPreferences_Entry<KeyCode> eToggle, eRangeKey;
+        static MelonPreferences_Entry<int> eSpotMax;
         static MelonPreferences_Entry<float> eLockAngle, eMaxRange, eCircleRadius, eBoxPadding,
             eMinScreenRadius;
 
@@ -125,7 +141,36 @@ namespace LeadIndicator
 
         static Texture2D whiteTex;
         static Texture2D ringTex;
+        static Texture2D ringTexWhite;
         static GUIStyle rangeStyle;
+        static GUIStyle spotStyle;
+
+        // ---------------------------------------------------------------- 队友报点的自动提前圈（1.8.0）
+        // 一条报点对应一个 track：报点没过期就留着，速度自己抹平，每帧重投影。
+        // 它和上面手动锁定的那套（target/boxRect/leadScreen）完全分开，互不覆盖。
+        class SpotTrack
+        {
+            public GHPC.Unit unit;
+            public float expiry;
+            public Vector3 velocity;
+            public Rect rect;
+            public Vector2 ring;
+            public bool hasRect;
+            public bool hasRing;
+            public string label = "";
+            public float alpha = 1f;
+        }
+
+        struct SpotCandidate
+        {
+            public GHPC.Unit unit;
+            public float expiry;
+        }
+
+        static readonly List<SpotTrack> spots = new List<SpotTrack>(4);
+        static readonly List<SpotCandidate> candidates = new List<SpotCandidate>(16);
+        static float spotRefreshTime;
+        static bool spotFaultNoticed;
 
         public override void OnInitializeMelon()
         {
@@ -169,6 +214,13 @@ namespace LeadIndicator
                 + "炮镜放大倍率越大这个门槛越容易过，所以瞄具拉着打远距离不受影响。填 0 关掉这条");
             eDebugLog = cat.CreateEntry<bool>("DebugLog", false,
                 "把锁定/测距/飞行时间/火控距离写进 Bin/Mods/LeadIndicator.debug.log，只在排查问题时打开");
+            eSpotLead = cat.CreateEntry<bool>("SpotTargetLead", true,
+                "队友和车长通过无线电报过的敌方目标，自动画上提前量框（橙黄色，和按 Alt 自己锁的绿框分开）。"
+                + "用的就是游戏自己那套报点网络（和小地图上的报点标记同源），没有上报就没有框；"
+                + "上报 90 秒后自动过期，圈会先变淡再消失。本车火控损坏（计算机被打掉或没电）时这一层整个不给用。"
+                + "只画不碰炮：要不要把准星压上去还是玩家自己的事");
+            eSpotMax = cat.CreateEntry<int>("SpotLeadMax", 3,
+                "同时最多给几辆被报点的车画框（1 到 5）。上报比这个多时，留最近收到的那几个");
 
             try
             {
@@ -196,11 +248,12 @@ namespace LeadIndicator
             if (eDebugLog.Value) OpenLog();
             MelonLogger.Msg("提前量指示器 已加载（炮手镜里按 " + LockKeyName() + " 锁定，"
                 + eToggle.Value + " 开关，" + (eEnabled.Value ? "现在是开的" : "现在是关的") + "）");
-            Log("LeadIndicator 1.7.4 initialised, enabled=" + eEnabled.Value
+            Log("LeadIndicator 1.8.0 initialised, enabled=" + eEnabled.Value
                 + " lock key=" + LockKeyName() + " toggle=" + eToggle.Value
                 + " suppress fcs lead=" + eSuppressLead.Value + " auto range=" + eAutoRange.Value
                 + " respect sight range=" + eSightRange.Value
-                + " cone=" + eLockAngle.Value + " max range=" + eMaxRange.Value);
+                + " cone=" + eLockAngle.Value + " max range=" + eMaxRange.Value
+                + " spot lead=" + eSpotLead.Value + " spot max=" + eSpotMax.Value);
         }
 
         public override void OnUpdate()
@@ -225,6 +278,7 @@ namespace LeadIndicator
                 altIsDown = false;
                 altWasCombined = false;
                 if (target != null) Release(eEnabled.Value ? "left the gunner sight" : "mod is off");
+                ClearSpots();
                 return;
             }
 
@@ -240,9 +294,13 @@ namespace LeadIndicator
                 else LockTarget(pi);
             }
 
+            var cam = MainCam();
+
+            // 队友报点的自动提前圈要在「没手动锁目标」时也照画，所以必须排在下面那个提前 return 之前
+            UpdateSpotLeads(pi, cam);
+
             if (target == null) return;
 
-            var cam = MainCam();
             string why = null;
             if (cam == null || !StillValid(pi, cam, out why))
             {
@@ -607,14 +665,7 @@ namespace LeadIndicator
 
         void UpdateLock(GHPC.Player.PlayerInput pi, Camera cam)
         {
-            GHPC.Weapons.WeaponSystemInfo info = null;
-            try
-            {
-                var brain = pi.CurrentPlayerCrewBrain;
-                var module = brain != null ? brain.WeaponsModule : null;
-                info = module != null ? module.ActiveWeapon : null;
-            }
-            catch { info = null; }
+            var info = ActiveWeapon(pi);
 
             if (info == null) { Release("no active weapon"); return; }
             if (lockedWeapon != null && info != lockedWeapon) { Release("active weapon changed"); return; }
@@ -682,6 +733,329 @@ namespace LeadIndicator
             }
 
             LogThrottled(distance, flight, velocity.magnitude, fcs, sightRange, holdover);
+        }
+
+        // ---------------------------------------------------------------- 队友报点的自动提前圈（1.8.0）
+
+        static GHPC.Weapons.WeaponSystemInfo ActiveWeapon(GHPC.Player.PlayerInput pi)
+        {
+            try
+            {
+                var brain = pi != null ? pi.CurrentPlayerCrewBrain : null;
+                var module = brain != null ? brain.WeaponsModule : null;
+                return module != null ? module.ActiveWeapon : null;
+            }
+            catch { return null; }
+        }
+
+        // 画的是「队友报过的车现在该瞄哪儿」：报点表来自游戏自己的无线电（和小地图标记同一份），
+        // 提前量算法跟手动锁定共用（飞行时间、标尺补偿）。全程只算只画，不写火控、不压火控提前量。
+        void UpdateSpotLeads(GHPC.Player.PlayerInput pi, Camera cam)
+        {
+            if (cam == null || !eSpotLead.Value)
+            {
+                ClearSpots();
+                return;
+            }
+
+            // 报点时间戳用的就是 timeSinceLevelLoad（Radio.StoreSpottedTarget 里 set_Timestamp 那个），
+            // 判过期必须跟它同一个时钟，不能用 Time.time 或 unscaledTime
+            float now = Time.timeSinceLevelLoad;
+            if (now >= spotRefreshTime)
+            {
+                spotRefreshTime = now + 0.25f;
+                CollectSpots(pi, now);
+            }
+
+            if (spots.Count == 0) return;
+
+            var info = ActiveWeapon(pi);
+            var fcs = info != null ? info.FCS : null;
+
+            // 火控坏了（计算机被打掉或没电）⇒ 这一层整片收掉：玩家的火控已经没有弹道解算能力，
+            // 照着电脑给的圈打只会误导。只把当帧的绘制标志摘掉，车还留在表里，修好火控立刻恢复。
+            bool fault;
+            try { fault = fcs != null && fcs.FcsFault; } catch { fault = false; }
+            if (fault)
+            {
+                for (int i = 0; i < spots.Count; i++) Hide(spots[i]);
+                if (!spotFaultNoticed)
+                {
+                    spotFaultNoticed = true;
+                    ShowNotice("火控故障 - 报点目标自动提前量不可用");
+                    Log("spot lead blocked: fcs fault on " + (fcs != null ? fcs.name : "?"));
+                }
+                return;
+            }
+            spotFaultNoticed = false;
+
+            AmmoType ammo = null;
+            try { ammo = info != null && info.Weapon != null ? info.Weapon.CurrentAmmoType : null; } catch { ammo = null; }
+
+            Vector3 origin = cam.transform.position;
+            try
+            {
+                if (info != null && info.Weapon != null && info.Weapon.MuzzleIdentity != null)
+                    origin = info.Weapon.MuzzleIdentity.position;
+            }
+            catch { }
+
+            float sightRange = 0f;
+            try { sightRange = fcs != null ? fcs.CurrentRange : 0f; } catch { sightRange = 0f; }
+
+            float blend = 1f - Mathf.Exp(-Time.unscaledDeltaTime / 0.2f);
+
+            for (int i = spots.Count - 1; i >= 0; i--)
+            {
+                SpotTrack t = spots[i];
+                GHPC.Unit u = t.unit;
+                Vector3 centre;
+                if (u == null || !UnitAlive(u) || !TryCentre(u, out centre))
+                {
+                    Log("spot dropped: " + (u != null ? SafeName(u) : "gone"));
+                    spots.RemoveAt(i);
+                    continue;
+                }
+
+                try { t.velocity = Vector3.Lerp(t.velocity, u.Velocity, blend); } catch { }
+
+                float distance = Vector3.Distance(origin, centre);
+                if (distance < 5f || distance > eMaxRange.Value) { Hide(t); continue; }
+
+                float flight = FlightTime(ammo, distance);
+                Vector3 lead = centre + t.velocity * flight;
+                flight = FlightTime(ammo, Vector3.Distance(origin, lead));
+                lead = centre + t.velocity * flight;
+                float holdover = eSightRange.Value ? SightHoldover(ammo, sightRange, distance) : 0f;
+                Vector3 aim = lead + Vector3.up * holdover;
+
+                t.hasRing = TryProject(cam, aim, out t.ring) && OnScreen(t.ring, 80f);
+                t.hasRect = SpotBox(cam, u, centre, out t.rect);
+                t.label = Mathf.RoundToInt(distance) + " m";
+                // 报点只剩 15 秒时开始变淡，到点自然消失——和地图标记的淡化同一个意思
+                t.alpha = 0.25f + 0.75f * Mathf.Clamp01((t.expiry - now) / 15f);
+            }
+        }
+
+        // 重建「现在在画的报点车」列表。逐帧重读一遍整张报点表没必要，0.25 秒一次就够跟上报点节奏。
+        void CollectSpots(GHPC.Player.PlayerInput pi, float now)
+        {
+            GHPC.Unit own = null;
+            try { own = pi.CurrentPlayerUnit; } catch { own = null; }
+
+            GHPC.AI.Radios.Radio radio = null;
+            try { radio = own != null ? own.Radio : null; } catch { radio = null; }
+
+            if (own == null || radio == null)
+            {
+                // 这台车的 prefab 上没挂无线电，游戏自己的报点标记同样不会有，不是模组坏了
+                if (spots.Count > 0) Log("spot lead: player unit has no radio");
+                ClearSpots();
+                return;
+            }
+
+            List<GHPC.AI.Radios.SpottingEvent> entries = null;
+            try { entries = radio.SpottingEntries; }
+            catch (Exception e) { LogOnce("radio threw: " + e.Message); }
+
+            candidates.Clear();
+            GHPC.Faction ours = GHPC.Faction.Neutral;
+            try { ours = own.Allegiance; } catch { }
+
+            if (entries != null)
+            {
+                int count = entries.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    GHPC.AI.Radios.SpottingEvent ev = null;
+                    try { ev = entries[i]; } catch { break; }
+                    if (ev == null) continue;
+
+                    float expiry;
+                    try { expiry = ev.ExpiryTimestamp; } catch { continue; }
+                    if (expiry < now) continue;
+
+                    GHPC.Unit u = null;
+                    try { u = ev.Target.Unit; } catch { u = null; }
+                    // 位置一律取实时车体中心，SpottingData.Position 是报点那一刻的快照，车开走了它不动
+                    if (u == null || u == own || u == target) continue;
+                    if (!UnitAlive(u)) continue;
+
+                    GHPC.Faction al;
+                    try { al = u.Allegiance; } catch { continue; }
+                    if (al == ours || al == GHPC.Faction.Neutral) continue;
+
+                    int have = IndexOfCandidate(u);
+                    if (have >= 0)
+                    {
+                        if (expiry > candidates[have].expiry)
+                        {
+                            // List 里的结构体取出来是副本，改完得放回去
+                            SpotCandidate older = candidates[have];
+                            older.expiry = expiry;
+                            candidates[have] = older;
+                        }
+                    }
+                    else if (candidates.Count < 24)
+                    {
+                        SpotCandidate c = new SpotCandidate();
+                        c.unit = u;
+                        c.expiry = expiry;
+                        candidates.Add(c);
+                    }
+                }
+            }
+
+            // 正在画的车：报点被删或过期就摘掉，还在就跟着最新那条续时效
+            for (int i = spots.Count - 1; i >= 0; i--)
+            {
+                int have = IndexOfCandidate(spots[i].unit);
+                if (have < 0)
+                {
+                    Log("spot ended: " + SafeName(spots[i].unit));
+                    spots.RemoveAt(i);
+                    continue;
+                }
+                spots[i].expiry = candidates[have].expiry;
+            }
+
+            int max = Mathf.Clamp(eSpotMax.Value, 1, 5);
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                SpotCandidate c = candidates[i];
+                if (IndexOfTracked(c.unit) >= 0) continue;
+
+                if (spots.Count < max)
+                {
+                    spots.Add(NewTrack(c));
+                    Log("spot lead added: " + SafeName(c.unit) + " (report expires in "
+                        + (c.expiry - now).ToString("0") + " s)");
+                    continue;
+                }
+
+                // 满了就换成更新的那个报点，否则新报点会因为老报点还没过期而进不来
+                int weakest = -1;
+                for (int s = 0; s < spots.Count; s++)
+                    if (weakest < 0 || spots[s].expiry < spots[weakest].expiry) weakest = s;
+                if (weakest >= 0 && c.expiry > spots[weakest].expiry)
+                {
+                    Log("spot displaced: " + SafeName(spots[weakest].unit) + " -> " + SafeName(c.unit));
+                    spots[weakest] = NewTrack(c);
+                }
+            }
+        }
+
+        static SpotTrack NewTrack(SpotCandidate c)
+        {
+            var t = new SpotTrack();
+            t.unit = c.unit;
+            t.expiry = c.expiry;
+            try { t.velocity = c.unit.Velocity; } catch { t.velocity = Vector3.zero; }
+            return t;
+        }
+
+        static int IndexOfCandidate(GHPC.Unit u)
+        {
+            for (int i = 0; i < candidates.Count; i++)
+                if (candidates[i].unit == u) return i;
+            return -1;
+        }
+
+        static int IndexOfTracked(GHPC.Unit u)
+        {
+            for (int i = 0; i < spots.Count; i++)
+                if (spots[i].unit == u) return i;
+            return -1;
+        }
+
+        static void Hide(SpotTrack t)
+        {
+            t.hasRect = false;
+            t.hasRing = false;
+        }
+
+        void ClearSpots()
+        {
+            if (spots.Count > 0 && eDebugLog.Value) Log("spot lead cleared (" + spots.Count + ")");
+            spots.Clear();
+        }
+
+        static bool UnitAlive(GHPC.Unit u)
+        {
+            try
+            {
+                var go = u.gameObject;
+                if (go == null || !go.activeInHierarchy) return false;
+                if (u.Destroyed) return false;
+                try { if (u.Neutralized) return false; } catch { }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static bool TryCentre(GHPC.Unit u, out Vector3 centre)
+        {
+            centre = Vector3.zero;
+            try
+            {
+                var c = u.Center;
+                if (c == null) return false;
+                centre = c.position;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // 屏幕框用游戏自己的车体可见性点位（Unit.Extremities = 车体四角那一圈 transform）投影取包围盒。
+        // 不给每辆报点车跑 CacheShape：那套要遍历几十块部件几何，三辆车逐帧跑不划算，而这里只是个识别框。
+        static bool SpotBox(Camera cam, GHPC.Unit u, Vector3 centre, out Rect rect)
+        {
+            rect = new Rect();
+            Vector3 basePoint = cam.WorldToScreenPoint(centre);
+            if (basePoint.z <= 0.01f) return false;
+
+            float minX = basePoint.x, maxX = basePoint.x;
+            float minY = Screen.height - basePoint.y, maxY = minY;
+
+            Accumulate(cam, centre + Vector3.up * 0.8f, ref minX, ref maxX, ref minY, ref maxY);
+
+            List<Transform> pts = null;
+            try { pts = u.Extremities; } catch { pts = null; }
+            if (pts != null)
+            {
+                for (int i = 0; i < pts.Count; i++)
+                {
+                    var t = pts[i];
+                    if (t == null) continue;
+                    Accumulate(cam, t.position, ref minX, ref maxX, ref minY, ref maxY);
+                }
+            }
+
+            float cx = (minX + maxX) * 0.5f, cy = (minY + maxY) * 0.5f;
+            if (maxX - minX < 8f) { minX = cx - 4f; maxX = cx + 4f; }
+            if (maxY - minY < 8f) { minY = cy - 4f; maxY = cy + 4f; }
+
+            float pad = Mathf.Max(0f, eBoxPadding.Value);
+            rect = Rect.MinMaxRect(minX - pad, minY - pad, maxX + pad, maxY + pad);
+            return OnScreen(new Vector2(cx, cy), 180f);
+        }
+
+        static void Accumulate(Camera cam, Vector3 world, ref float minX, ref float maxX,
+            ref float minY, ref float maxY)
+        {
+            Vector3 sp = cam.WorldToScreenPoint(world);
+            if (sp.z <= 0.01f) return;
+            if (sp.x < minX) minX = sp.x;
+            if (sp.x > maxX) maxX = sp.x;
+            float gy = Screen.height - sp.y;
+            if (gy < minY) minY = gy;
+            if (gy > maxY) maxY = gy;
+        }
+
+        static bool OnScreen(Vector2 gui, float margin)
+        {
+            return gui.x >= -margin && gui.x <= Screen.width + margin
+                && gui.y >= -margin && gui.y <= Screen.height + margin;
         }
 
         void ApplyRange(GHPC.Weapons.FireControlSystem fcs, float distance)
@@ -1147,7 +1521,7 @@ namespace LeadIndicator
                     {
                         DrawLine(boxRect.center, leadScreen, thickness,
                             new Color(green.r, green.g, green.b, 0.55f));
-                        DrawRing(leadScreen, Mathf.Max(5f, eCircleRadius.Value * scale), green);
+                        DrawRing(ringTex, leadScreen, Mathf.Max(5f, eCircleRadius.Value * scale), green);
                     }
                 }
 
@@ -1165,6 +1539,8 @@ namespace LeadIndicator
                 }
             }
 
+            DrawSpotLeads();
+
             GUI.matrix = matrix;
         }
 
@@ -1181,6 +1557,12 @@ namespace LeadIndicator
             {
                 ringTex = CreateRingTexture(56, 4f, new Color(0.25f, 1f, 0.35f, 1f));
                 ringTex.hideFlags = HideFlags.HideAndDontSave;
+            }
+            if (ringTexWhite == null)
+            {
+                // 报点那套是橙黄色，绿环当底会被 GUI.color 乘成脏黄色，所以单独要一张白的
+                ringTexWhite = CreateRingTexture(56, 4f, Color.white);
+                ringTexWhite.hideFlags = HideFlags.HideAndDontSave;
             }
         }
 
@@ -1224,12 +1606,12 @@ namespace LeadIndicator
             DrawLine(new Vector2(r.xMin, r.yMax), new Vector2(r.xMin, r.yMin), thickness, color);
         }
 
-        static void DrawRing(Vector2 centre, float radius, Color color)
+        static void DrawRing(Texture2D tex, Vector2 centre, float radius, Color color)
         {
-            if (ringTex == null) return;
+            if (tex == null) return;
             var old = GUI.color;
             GUI.color = color;
-            GUI.DrawTexture(new Rect(centre.x - radius, centre.y - radius, radius * 2f, radius * 2f), ringTex);
+            GUI.DrawTexture(new Rect(centre.x - radius, centre.y - radius, radius * 2f, radius * 2f), tex);
             GUI.color = old;
         }
 
@@ -1274,11 +1656,69 @@ namespace LeadIndicator
             GUI.color = old;
         }
 
+        // 报点那一层用橙黄，和玩家自己按 Alt 锁的绿框分开；只画线框和圈，不铺底板挡画面。
+        static void DrawSpotLeads()
+        {
+            if (!eEnabled.Value || !eSpotLead.Value || spots.Count == 0) return;
+            if (GHPC.AarController.InAar) return;
+            if (Event.current != null && Event.current.type != EventType.Repaint) return;
+
+            EnsureTextures();
+            float scale = Mathf.Clamp(Screen.height / 1080f, 0.75f, 2f);
+            float thickness = Mathf.Max(1f, Mathf.Round(2f * scale));
+            float radius = Mathf.Max(4f, eCircleRadius.Value * scale * 0.8f);
+
+            for (int i = 0; i < spots.Count; i++)
+            {
+                SpotTrack t = spots[i];
+                bool box = eShowBox.Value && t.hasRect;
+                bool ring = eShowCircle.Value && t.hasRing;
+                if (!box && !ring) continue;
+
+                var col = new Color(1f, 0.78f, 0.25f, 0.92f * t.alpha);
+                if (box) DrawOutline(t.rect, thickness, col);
+                if (ring)
+                {
+                    if (box) DrawLine(t.rect.center, t.ring, thickness,
+                        new Color(col.r, col.g, col.b, col.a * 0.55f));
+                    DrawRing(ringTexWhite, t.ring, radius, col);
+                }
+
+                if (eShowRange.Value && !string.IsNullOrEmpty(t.label))
+                {
+                    Vector2 at = box
+                        ? new Vector2(t.rect.x, t.rect.yMax + 2f * scale)
+                        : new Vector2(t.ring.x + radius + 3f, t.ring.y - 9f * scale);
+                    DrawSpotText(t.label, at, col, scale);
+                }
+            }
+        }
+
+        static void DrawSpotText(string text, Vector2 topLeft, Color color, float scale)
+        {
+            if (spotStyle == null)
+            {
+                spotStyle = new GUIStyle(GUI.skin.label);
+                spotStyle.fontSize = Mathf.RoundToInt(13f * scale);
+                spotStyle.alignment = TextAnchor.UpperLeft;
+                spotStyle.normal.textColor = Color.white;
+            }
+            var old = GUI.color;
+            GUI.color = color;
+            GUI.Label(new Rect(topLeft.x, topLeft.y, 200f, 20f * scale), text, spotStyle);
+            GUI.color = old;
+        }
+
         // ---------------------------------------------------------------- lifecycle / logging
 
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
         {
             Release("scene loaded: " + sceneName);
+            spots.Clear();
+            candidates.Clear();
+            // timeSinceLevelLoad 换了任务会从头计，下次收集必须立刻放行
+            spotRefreshTime = 0f;
+            spotFaultNoticed = false;
             targetRenderers = null;
             targetColliders = null;
             boxFrame = null;
