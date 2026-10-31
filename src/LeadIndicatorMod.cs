@@ -7,7 +7,7 @@ using HarmonyLib;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LeadIndicator.LeadIndicatorMod), "提前量指示器", "1.9.0", "rhino2024")]
+[assembly: MelonInfo(typeof(LeadIndicator.LeadIndicatorMod), "提前量指示器", "1.11.1", "rhino2024")]
 [assembly: MelonGame("Radian Simulations LLC", "GHPC")]
 
 namespace LeadIndicator
@@ -59,11 +59,42 @@ namespace LeadIndicator
     //     否则玩家会照着电脑给的圈打，而炮实际上根本没有弹道解算。
     //     数量上限 SpotLeadMax 默认 3，同一时刻同一辆车只算一个框，超出上限留最近收到的报点。
     //
+    // 1.11.1：报点目标是步兵（人形）时不画绿框、不画提前圈、也不画圆圈外箭头。GHPC 用 Unit.Type 区分
+    //     UnitType.Infantry，所以在三条选目标的路上都把它滤掉：手动 Alt 的 LockTarget、报点自动锁的
+    //     PickSpot、圆圈外箭头用的 NewestReported。步兵不是一个能算提前量的装甲目标，给它画框只会误导；
+    //     报点表里最新一条是步兵时，自动退到下一条还在时效内的载具报点，而不是整层不工作。
+    //
+    // 1.11.0：用户要求「乘员报出敌人位置后，如果敌人不在炮镜范围（整个圆圈）里，就在镜内出现一个指向
+    //     敌人方向的绿色箭头，直到镜里看到它才消失」。所以加了一层纯屏幕指示：
+    //     · 目标来源：优先粘着的那辆（spotHold，1.10.0 的「打死前不换人」），否则取报点表里最新一条
+    //       还没过期的敌方报点。**不看可见性**——正因为看不见才需要箭头，看得见就该是绿框那套了。
+    //     · 判「在不在镜里」：车体中心投影到屏幕，离屏幕中心超过圆圈半径就算不在；进圈立刻收起箭头。
+    //       圆圈半径 = 屏幕短边的 SightCirclePercent%（默认 100，即整个高度），箭头画在 0.86 倍处，
+    //       粗细由 SightArrowThickness 定（默认 5.5 px @1080p，原来那版 2.5 px 看着像细线）。
+    //     · 方向：正常的屏幕投影方向；目标在身后投影不出来时，按相机空间左右方位指到圆圈的左/右边缘，
+    //       再带一点俯仰，玩家照着转镜头就能把它转进镜里。
+    //     · 锁着目标时不画：StillValid 已经要求目标在 35 度视野锥里且有视线，绿框够了，再加箭头只是碍事。
+    //     · 不做射线、不碰火控、不碰炮塔、不打激光，纯粹是屏幕上一根绿色箭头。
+    //
+    // 1.10.0：用户要求「乘员报敌方位置、出现提前量框时，不要自动测距、不要调整标尺，而且要等第一个
+    //     敌人被消灭后才能切换到第二个敌人给提前量框」。所以报点这条路的两处改动：
+    //     ① 报点自动锁不再替玩家打激光（LockUnit 里 fromSpot 一律跳过 pi.Lase()），AutoRange 即使被人
+    //        手动打开也在报点锁期间不写 FCS.TargetRange —— 标尺完全是玩家自己的事，我们只画框画圈。
+    //        （激光本身还有代价：对侧的激光告警会亮，等于模组替玩家暴露一次位置。）
+    //        提前圈的水平提前量照旧按目标真实距离算，垂直方向照旧按炮镜当前标尺补抬落（1.7.4 那套
+    //        SightHoldover），所以「标尺没测到真实距离」并不会让圈变错，只是要玩家自己抬到位。
+    //     ② 粘住第一辆：LockUnit 认下某辆报点车后把它记进 spotHold，此后每帧只认这一辆——
+    //        它暂时被山挡住／开出屏幕就等（绿框消失，露头自动回来），新报点来了也不换人；
+    //        清空 spotHold 的只有「这辆车被消灭（游戏自己的 Unit.Neutralized，跟残骸清理同一标准）
+    //        或从场景里没了」、换任务、F4 把模组关掉、切回 ManualAlt。进出炮镜不清，清了就等于
+    //        回到「谁报得最新锁谁」那种一跳一跳的老毛病。
+    //     手动 Alt 那条路一点没变：照样打激光、照样吃 AutoRange、照样换目标就是关一下再开一下。
+    //
     // 1.9.0：用户要求「多目标改成只给一个框（绿色，相当于自动帮忙按了 Alt），并且这个功能和单按 Alt
     //     不能同时用，在配置里选模式」。所以 1.8.0 那层橙黄多框整个删掉，报点这条路改走手动锁定的同一条链路：
     //     LeadMode=AutoSpot 时每 0.25 秒重读一遍无线电报点表，取**最新那条**还看得见、还没过期的报点，
     //     直接 LockUnit() 上去 —— 同一个绿框（还是 Collider 包围盒那套）、同一个提前圈、同样压火控提前量
-    //     （SuppressFcsLead）、同样打一次激光测距，只是目标由报点决定，玩家手不离开鼠标。
+    //     （SuppressFcsLead），只是目标由报点决定，玩家手不离开鼠标。（当时还照打一次激光测距，1.10.0 取消。）
     //     只锁一辆：一门炮一次只解一个目标，锁两辆会互相抢火控距离和提前量压制状态。
     //     LeadMode=ManualAlt 是旧行为（Alt 开关、报点不自动锁）。两种模式抢的是同一个锁，所以 AutoSpot
     //     模式下按 Alt 一律不生效，只提示一次怎么切回去。
@@ -97,11 +128,11 @@ namespace LeadIndicator
     {
         static MelonPreferences_Category cat;
         static MelonPreferences_Entry<bool> eEnabled, eShowBox, eShowCircle, eShowRange,
-            eSuppressLead, eAutoRange, eRequireVisible, eSightRange, eDebugLog;
+            eSuppressLead, eAutoRange, eRequireVisible, eSightRange, eDebugLog, eSightArrow;
         static MelonPreferences_Entry<KeyCode> eToggle, eRangeKey;
         static MelonPreferences_Entry<string> eMode;
         static MelonPreferences_Entry<float> eLockAngle, eMaxRange, eCircleRadius, eBoxPadding,
-            eMinScreenRadius;
+            eMinScreenRadius, eSightCircle, eSightWidth;
 
         static readonly FieldInfo FullControlField =
             HarmonyLib.AccessTools.Field(typeof(GHPC.Player.PlayerInput), "_hasFullVehicleControl");
@@ -163,6 +194,17 @@ namespace LeadIndicator
         static GHPC.Unit autoAcquired; // 已经为哪辆报点车打过激光、报过一次：同一辆车反复进出视野不重复打
         static float autoRefreshTime;  // 下一次重读报点表（用 timeSinceLevelLoad，跟报点同一个时钟）
         static bool autoFaultNoticed;  // 「火控故障」提示只报一次，恢复或换场景才复位
+        // 1.10.0：报点自动锁「粘住」的那一辆。用户要的是打死第一个之前不许跳第二个，
+        // 所以这辆一旦被认下，就每帧只认它，别的报点再新也不换人。
+        static GHPC.Unit spotHold;
+        static float spotWaitAt;       // 「它正躲着，等它露头」那句提示的节流时钟（unscaledTime，跟报点时效无关）
+
+        // 1.11.0：炮镜圆圈外的报点箭头。目标不在圆圈里就沿圆圈内侧画一个指向它的绿色箭头，进圈就收起。
+        // 只在这一帧算一次几何，OnGUI 只管把当帧的 tip/dir 画出来。
+        static GHPC.Unit arrowUnit;
+        static bool arrowOn;
+        static Vector2 arrowTip;       // GUI 坐标下的箭头尖（落在圆圈内侧）
+        static Vector2 arrowDir;       // GUI 坐标下从圆心指向箭头尖的单位向量
 
         public override void OnInitializeMelon()
         {
@@ -184,7 +226,8 @@ namespace LeadIndicator
                 + "不压掉的话，你把准星往我们画的圈上移，它会在圈上再加一份，变成双倍提前");
             eAutoRange = cat.CreateEntry<bool>("AutoRange", false,
                 "锁定期间自动把火控距离校正到目标真实距离（全自动，不占用任何按键）。默认关闭；"
-                + "打开后没有激光测距仪的车也能直接按圈打中");
+                + "打开后没有激光测距仪的车也能直接按圈打中。"
+                + "只对玩家自己按 Alt 锁的目标生效——LeadMode=AutoSpot 那种队友报点自动出的框一律不测距、不动标尺");
             eSightRange = cat.CreateEntry<bool>("RespectSightRange", true,
                 "按炮镜上显示的标尺（准星旁边那个 400/800…，即火控当前距离）来画提前圈。"
                 + "标尺比目标真实距离短时，圈会抬到「用这个标尺打」真正该瞄的位置（打远目标要抬着打）；"
@@ -204,15 +247,28 @@ namespace LeadIndicator
                 "目标在屏幕上的尺寸门槛：拿游戏自己的车体可见性点位（Unit.Extremities，车体四角）量「中心到最远点」的"
                 + "像素半径，不足这个数就不锁定。远处的车在屏幕上只有几个像素，你肉眼认不出来，模组也不该替你锁；"
                 + "炮镜放大倍率越大这个门槛越容易过，所以瞄具拉着打远距离不受影响。填 0 关掉这条");
+            eSightArrow = cat.CreateEntry<bool>("ShowSightArrow", true,
+                "乘员或队友报过点的敌人不在炮镜圆圈里时，在镜内沿圆圈画一个绿色箭头指向它；它一进圆圈箭头就消失。"
+                + "只在炮手镜里画，车长镜/望远镜/外部视角都不画，也不占任何按键");
+            eSightCircle = cat.CreateEntry<float>("SightCirclePercent", 100f,
+                "箭头沿着多大一个圈走：炮镜圆圈直径占屏幕短边的百分比，默认 100（整个屏幕高度）。"
+                + "箭头画在这个圈 0.86 倍半径处；如果你的瞄具玻璃比屏幕窄，把它调小到箭头正好贴着镜筒内缘");
+            eSightWidth = cat.CreateEntry<float>("SightArrowThickness", 5.5f,
+                "绿色箭头有多粗：1080p 下的像素宽，高分屏按屏幕高度等比放大，默认 5.5（原来那版只有 2.5，看着像细线）。"
+                + "嫌细就往上加，3~10 之间都正常");
             eDebugLog = cat.CreateEntry<bool>("DebugLog", false,
                 "把锁定/测距/飞行时间/火控距离写进 Bin/Mods/LeadIndicator.debug.log，只在排查问题时打开");
             eMode = cat.CreateEntry<string>("LeadMode", "AutoSpot",
                 "提前量目标从哪来。两种模式用的是同一个锁，不能同时开，只能选一个："
                 + "ManualAlt＝老行为，炮手镜里单按锁定键（默认 LeftAlt）锁准星下方那辆车，队友报点不自动锁；"
                 + "AutoSpot＝车长或队友用无线电报过的敌方载具里，自动取最新那条报点、相当于替你按了一次 Alt："
-                + "同一个绿框、同一个提前圈、同样压掉火控提前量、同样打一次激光测距，全程不用按键，也只锁这一辆。"
+                + "同一个绿框、同一个提前圈、同样压掉火控提前量，全程不用按键，也只锁这一辆。"
+                + "AutoSpot 出的框不测距、不动标尺（不打激光，也不写火控距离），距离和标尺完全是你自己的事。"
+                + "而且它会粘住第一辆：那辆车没被消灭之前，后面再新的报点也不会把提前圈换走；"
+                + "它暂时被山挡住或开出屏幕，绿框就先消失、露头自己回来，绝不中途换目标。"
                 + "AutoSpot 下按 Alt 不生效（想手动锁就切回 ManualAlt）。"
-                + "被报点的车要真的从炮手镜看得见、还在 90 秒报点时效内才会锁；本车火控损坏（计算机被打掉或没电）时不锁");
+                + "被报点的车要真的从炮手镜看得见、还在 90 秒报点时效内才会第一次锁上；"
+                + "本车火控损坏（计算机被打掉或没电）时不锁");
 
             try
             {
@@ -240,7 +296,7 @@ namespace LeadIndicator
             if (eDebugLog.Value) OpenLog();
             MelonLogger.Msg("提前量指示器 已加载（" + ModeHint() + "，" + eToggle.Value
                 + " 开关模组，" + (eEnabled.Value ? "现在是开的" : "现在是关的") + "）");
-            Log("LeadIndicator 1.9.0 initialised, enabled=" + eEnabled.Value
+            Log("LeadIndicator 1.11.1 initialised, enabled=" + eEnabled.Value
                 + " mode=" + eMode.Value + " lock key=" + LockKeyName() + " toggle=" + eToggle.Value
                 + " suppress fcs lead=" + eSuppressLead.Value + " auto range=" + eAutoRange.Value
                 + " respect sight range=" + eSightRange.Value
@@ -255,7 +311,7 @@ namespace LeadIndicator
             {
                 eEnabled.Value = !eEnabled.Value;
                 try { cat.SaveToFile(false); } catch (Exception e) { Log("saving threw: " + e.Message); }
-                if (!eEnabled.Value) Release("mod switched off");
+                if (!eEnabled.Value) { Release("mod switched off"); ClearSpotHold("mod switched off"); ArrowOff("mod switched off"); }
                 ShowNotice(eEnabled.Value
                     ? "提前量指示器 已开启 - " + ModeHint()
                     : "提前量指示器 已关闭 - 按 " + eToggle.Value + " 恢复");
@@ -271,6 +327,9 @@ namespace LeadIndicator
                 altIsDown = false;
                 altWasCombined = false;
                 if (target != null) Release(eEnabled.Value ? "left the gunner sight" : "mod is off");
+                // 只是退出炮镜时不清粘着的那辆：回来还该继续打它。模组被关掉才清。
+                if (!eEnabled.Value) ClearSpotHold("mod is off");
+                ArrowOff("left the gunner sight");
                 ResetAutoSpot();
                 return;
             }
@@ -299,6 +358,9 @@ namespace LeadIndicator
 
             // 报点自动锁得在「手上还没锁着目标」的那些帧也跑，所以必须排在下面那个提前 return 之前
             UpdateAutoSpot(pi, cam);
+
+            // 炮镜圆圈外的报点箭头同样要在没有锁的帧里更新——它就是为「还没看见」那段时间画的
+            UpdateSightArrow(pi, cam);
 
             if (target == null) return;
 
@@ -397,7 +459,7 @@ namespace LeadIndicator
         static string ModeHint()
         {
             return IsAutoSpot()
-                ? "报点自动锁定：队友报过的车自动锁一辆"
+                ? "报点自动锁定：队友报过的车自动锁一辆，不测距不动标尺、打死它之前不换目标"
                 : "炮手镜里按 " + LockKeyName() + " 锁定准星下的目标";
         }
 
@@ -408,6 +470,17 @@ namespace LeadIndicator
             autoAcquired = null;
             autoRefreshTime = 0f;
             autoFaultNoticed = false;
+            // 注意这里不清 spotHold：进出炮镜就把「打死前不换」的对象丢掉，等于又回到
+            // 「谁报得最新锁谁」那种一跳一跳的老毛病（用户 1.10.0 明确不要）。
+        }
+
+        // 只有这几种情况才放开粘着：目标被消灭/从场景里没了、换任务、F4 关掉模组、切回 ManualAlt。
+        static void ClearSpotHold(string why)
+        {
+            if (spotHold == null) return;
+            Log("spot hold cleared: " + SafeName(spotHold) + " (" + why + ")");
+            spotHold = null;
+            spotWaitAt = 0f;
         }
 
         // ---------------------------------------------------------------- target selection
@@ -443,6 +516,7 @@ namespace LeadIndicator
                 var u = units[i];
                 if (u == null || u == own) continue;
                 if (u.Destroyed) continue;
+                if (IsHuman(u)) continue;   // 步兵不锁：没有提前量可言
                 if (u.Allegiance == own.Allegiance || u.Allegiance == GHPC.Faction.Neutral) continue;
 
                 Vector3 centre;
@@ -483,9 +557,10 @@ namespace LeadIndicator
             LockUnit(pi, best, bestDist, bestAngle, false);
         }
 
-        // 锁定的一整套动作，玩家按 Alt 和报点自动锁共用：写 target、记下当前武器、打一次激光、量车体框、报一句提示。
-        // fromSpot 只管两件事：提示文案，以及同一辆报点车反复进出视野时不再重复打激光／重复刷屏
-        //（激光是要被对面告警的，闪一次算一次暴露，不该由模组替玩家反复按）。
+        // 锁定的一整套动作，玩家按 Alt 和报点自动锁共用：写 target、记下当前武器、量车体框、报一句提示。
+        // 1.10.0 起激光测距只归手动那一下：报点自动锁不打激光（用户要「出框时不要自动测距、不要动标尺」，
+        // 而且激光会在对侧的激光告警上亮一下，等于模组替玩家暴露一次位置）。
+        // fromSpot 现在管三件事：提示文案、不替玩家打激光，以及同一辆车反复进出视野时不重复刷屏。
         void LockUnit(GHPC.Player.PlayerInput pi, GHPC.Unit best, float distance, float angle, bool fromSpot)
         {
             target = best;
@@ -503,9 +578,10 @@ namespace LeadIndicator
             catch { lockedWeapon = null; }
 
             bool repeat = fromSpot && autoAcquired == best;
-            if (!repeat)
+            if (!repeat && !fromSpot)
             {
-                // 让游戏自己的激光走一遍。没有激光测距仪的车这里什么都不发生，后面 AutoRange 会直接写距离
+                // 手动 Alt 那一下才让游戏自己的激光走一遍。没有激光测距仪的车这里什么都不发生，
+                // 后面 AutoRange 会不会补写距离看配置（报点锁期间一律不写）。
                 try { if (pi.CanRange) pi.Lase(); } catch (Exception e) { Log("Lase threw: " + e.Message); }
             }
             if (fromSpot) autoAcquired = best;
@@ -518,7 +594,7 @@ namespace LeadIndicator
             Log((fromSpot ? "auto locked " : "locked ") + name + " (" + best.Type + ") at "
                 + distance.ToString("0.0") + " m, angle " + angle.ToString("0.00") + " deg, weapon="
                 + (lockedWeapon != null ? lockedWeapon.Role + "/" + lockedWeapon.Name : "none")
-                + (repeat ? " (same spot report re-acquired, no extra lase)" : ""));
+                + (fromSpot ? "，报点锁不测距/不动标尺" + (repeat ? "（同一辆，重进视野不重复刷屏）" : "") : ""));
         }
 
         // 只按角度挑最近的一辆会锁到山后面、树线后面那些“肉眼根本不在视野里”的车（2026-10-24 用户实测）：
@@ -697,6 +773,7 @@ namespace LeadIndicator
             bool destroyed;
             try { destroyed = target.Destroyed; } catch { destroyed = false; }
             if (destroyed) { why = "target destroyed"; return false; }
+            if (IsHuman(target)) { why = "target is infantry"; return false; }
 
             Vector3 centre;
             try
@@ -804,7 +881,8 @@ namespace LeadIndicator
         }
 
         // 报点自动锁：从游戏自己的无线电报点表（和小地图标记同一份）里挑一辆，交给 LockUnit() —— 和玩家
-        // 按 Alt 走的是同一条链路，绿框、提前圈、压火控提前量、激光测距全是原来那一套，只是目标由报点决定。
+        // 按 Alt 走的是同一条链路，绿框、提前圈、压火控提前量全是原来那一套，只是目标由报点决定。
+        // 1.10.0 起这条路不碰距离：不打激光、不写 FCS.TargetRange，标尺完全留给玩家自己。
         // 只锁一辆：一门炮同一时刻只有一个弹道解算，锁两辆会互相抢火控距离和提前量压制状态。
         void UpdateAutoSpot(GHPC.Player.PlayerInput pi, Camera cam)
         {
@@ -812,6 +890,7 @@ namespace LeadIndicator
             {
                 // 玩家中途把 LeadMode 改回 ManualAlt：报点那把锁就地放开，Alt 重新接管
                 if (autoLock && target != null) Release("LeadMode back to ManualAlt");
+                ClearSpotHold("LeadMode back to ManualAlt");
                 ResetAutoSpot();
                 return;
             }
@@ -845,6 +924,70 @@ namespace LeadIndicator
             }
             autoFaultNoticed = false;
 
+            // 1.10.0（用户原话「要等第一个敌人被消灭后才能切换到第二个敌人给提前量框」）：
+            // 粘着的那辆还活着就只认它，别的报点再新也不换人。判定用游戏自己的 Unit.Neutralized
+            // （和残骸清理同一标准），车从场景里没了同样算消灭。
+            if (spotHold != null && !UnitAlive(spotHold)) ClearSpotHold("neutralized / gone");
+
+            if (spotHold != null)
+            {
+                // 正锁着它：下面逐帧那套继续跟，不重锁（重锁会再刷一次提示）
+                if (autoLock && target == spotHold)
+                {
+                    losRetryTime = 0f;
+                    losPartial = false;
+                    return;
+                }
+                // 手里还锁着别辆（切车、火控刚恢复那类留下的自动锁）：先放开，只认这辆
+                if (target != null) Release("spot hold is " + SafeName(spotHold));
+
+                GHPC.Unit mine = null;
+                try { mine = pi.CurrentPlayerUnit; } catch { mine = null; }
+
+                float hd = -1f;
+                bool lockable = false;
+                string waitWhy = null;
+                Vector3 centre;
+                if (TryCentre(spotHold, out centre))
+                {
+                    Vector3 to = centre - cam.transform.position;
+                    hd = to.magnitude;
+                    if (hd < 5f) waitWhy = "贴得比 5 m 还近";
+                    else if (hd > eMaxRange.Value) waitWhy = "超出 MaxRange " + eMaxRange.Value.ToString("0") + " m";
+                    else
+                    {
+                        // force=true：这一下必须现算，不能吃上一辆车留下的补采缓存
+                        if (eRequireVisible.Value && mine != null
+                            && !GameCanSee(mine, cam.transform.position, spotHold, centre, true))
+                            waitWhy = "被地形或别的车挡住";
+                        else
+                        {
+                            Vector2 gui;
+                            if (!TryProject(cam, centre, out gui) || !OnScreen(gui, 60f))
+                                waitWhy = "投影不在屏幕上";
+                        }
+                    }
+                    lockable = waitWhy == null;
+                }
+                else waitWhy = "读不到车体中心";
+
+                if (!lockable)
+                {
+                    // 它躲起来了／开出去了：等，不跳去锁第二个。绿框这段时间不画，露头自己回来。
+                    if (Time.unscaledTime >= spotWaitAt)
+                    {
+                        spotWaitAt = Time.unscaledTime + 3f;
+                        ShowNotice("报点目标 " + SafeName(spotHold) + " " + waitWhy + " - 打死它之前不换目标");
+                        Log("spot hold waiting: " + SafeName(spotHold) + " - " + waitWhy);
+                    }
+                    return;
+                }
+
+                LockUnit(pi, spotHold, hd, Vector3.Angle(cam.transform.forward, centre - cam.transform.position), true);
+                spotWaitAt = 0f;
+                return;
+            }
+
             GHPC.Unit chosen;
             float expiry, distance, angle;
             if (!PickSpot(pi, cam, out chosen, out expiry, out distance, out angle))
@@ -859,19 +1002,22 @@ namespace LeadIndicator
                 return;
             }
 
-            // 还是原来那辆：不重锁（重锁会再打一次激光、再刷一次提示），下面逐帧那套继续跟。
-            // 顺手把视线缓存作废——PickSpot 刚为各个候选跑过 force 补采，留的是别人的结果
+            // 走到这里说明手上没有「还活着的报点目标」：这才是第一次认目标（或上一辆刚被打死）。
+            // 还是原来那辆的分支留着当兜底：重锁会再刷一次提示、再把火控状态重走一遍。
             if (autoLock && target == chosen)
             {
+                // 顺手作废视线缓存：PickSpot 刚为各个候选跑过 force 补采，留的是别人的结果
                 losRetryTime = 0f;
                 losPartial = false;
+                spotHold = chosen;
                 return;
             }
 
             if (autoLock && target != null)
-                Log("auto spot switched: " + SafeName(target) + " -> " +
-                    SafeName(chosen) + " (report expires in " + (expiry - now).ToString("0") + " s)");
+                Log("auto spot picked: " + SafeName(target) + " -> " + SafeName(chosen)
+                    + "（前一辆已经不在粘着表里，报点时效还剩 " + (expiry - now).ToString("0") + " s）");
             LockUnit(pi, chosen, distance, angle, true);
+            spotHold = chosen;
         }
 
         // 挑「现在该锁的报点车」。同一辆车可能被车长和队友各报一次，取时效最晚那条；几辆不同的车之间取
@@ -924,6 +1070,7 @@ namespace LeadIndicator
                 try { u = ev.Target.Unit; } catch { u = null; }
                 // 位置一律取实时车体中心，SpottingData.Position 是报点那一刻的快照，车开走了它不动
                 if (u == null || u == own || !UnitAlive(u)) continue;
+                if (IsHuman(u)) continue;   // 报点里混进来的步兵：不锁、不画框
 
                 GHPC.Faction al;
                 try { al = u.Allegiance; } catch { continue; }
@@ -958,6 +1105,147 @@ namespace LeadIndicator
                 angle = Vector3.Angle(cam.transform.forward, to);
             }
             return chosen != null;
+        }
+
+        // ---------------------------------------------------------------- 炮镜圆圈外的报点箭头（1.11.0）
+
+        // 收起箭头。why 只进调试日志，方便回头查「为什么这帧没画」。
+        static void ArrowOff(string why)
+        {
+            if (arrowUnit != null) Log("sight arrow off: " + SafeName(arrowUnit) + " (" + why + ")");
+            arrowOn = false;
+            arrowUnit = null;
+        }
+
+        // 圆圈半径：屏幕短边的一半 × SightCirclePercent%。填 0.8 这种比例也认，填 0 或乱填退回 100%。
+        static float SightCircleRadius()
+        {
+            float pct = 100f;
+            try { pct = eSightCircle.Value; } catch { }
+            if (pct > 0f && pct <= 1f) pct *= 100f;
+            if (pct <= 1f || pct > 100f) pct = 100f;
+            return Mathf.Min(Screen.width, Screen.height) * 0.5f * (pct / 100f);
+        }
+
+        // 报点表里最新一条还没过期的敌方报点。粘着的那辆优先（1.10.0 认下的目标就是它），其余按「谁报得最新」挑。
+        // **不看可见性**：看不见正是这条箭头存在的理由——看得见的时候该出现的是绿框那套。
+        static bool NewestReported(GHPC.Player.PlayerInput pi, out GHPC.Unit unit, out float expiry)
+        {
+            unit = null;
+            expiry = 0f;
+
+            var hold = spotHold;
+            if (hold != null)
+            {
+                if (UnitAlive(hold)) { unit = hold; expiry = float.MaxValue; return true; }
+                ClearSpotHold("neutralized / gone");
+            }
+
+            GHPC.Unit own = null;
+            try { own = pi != null ? pi.CurrentPlayerUnit : null; } catch { own = null; }
+            GHPC.AI.Radios.Radio radio = null;
+            try { radio = own != null ? own.Radio : null; } catch { radio = null; }
+            if (own == null || radio == null) return false;
+
+            List<GHPC.AI.Radios.SpottingEvent> entries = null;
+            try { entries = radio.SpottingEntries; } catch { return false; }
+            if (entries == null) return false;
+
+            float now = Time.timeSinceLevelLoad;
+            GHPC.Faction ours = GHPC.Faction.Neutral;
+            try { ours = own.Allegiance; } catch { }
+
+            for (int i = 0; i < entries.Count; i++)
+            {
+                GHPC.AI.Radios.SpottingEvent ev = null;
+                try { ev = entries[i]; } catch { break; }
+                if (ev == null) continue;
+
+                float when;
+                try { when = ev.ExpiryTimestamp; } catch { continue; }
+                if (when < now || when <= expiry) continue;
+
+                GHPC.Unit t = null;
+                try { t = ev.Target.Unit; } catch { }
+                if (t == null || t == own || !UnitAlive(t)) continue;
+                if (IsHuman(t)) continue;   // 最新报点是步兵就退到下一条载具报点
+
+                GHPC.Faction al;
+                try { al = t.Allegiance; } catch { continue; }
+                if (al == ours || al == GHPC.Faction.Neutral) continue;
+
+                Vector3 centre;
+                if (!TryCentre(t, out centre)) continue;
+                float d = Vector3.Distance(centre, own.transform.position);
+                if (d < 5f || d > eMaxRange.Value) continue;
+
+                unit = t;
+                expiry = when;
+            }
+            return unit != null;
+        }
+
+        // 每帧更新箭头：报点目标在圆圈外就有箭头，进圈/锁定/离镜立刻收起。只算屏幕几何，不射线、不碰火控。
+        void UpdateSightArrow(GHPC.Player.PlayerInput pi, Camera cam)
+        {
+            bool wasOn = arrowOn;
+            arrowOn = false;
+
+            if (!eSightArrow.Value || cam == null || GHPC.AarController.InAar) { ArrowOff("arrow off by config / aar"); return; }
+            // 锁着目标就不画：StillValid 已经要求它在 35 度视野锥里且有视线，绿框够了
+            if (target != null) { ArrowOff("target locked"); return; }
+
+            GHPC.Unit u;
+            float expiry;
+            if (!NewestReported(pi, out u, out expiry)) { ArrowOff("no spot report"); return; }
+
+            Vector3 centre;
+            if (!TryCentre(u, out centre)) { ArrowOff("no target centre"); return; }
+
+            float radius = SightCircleRadius();
+            if (radius < 8f) { ArrowOff("sight circle too small"); return; }
+
+            var screenCentre = new Vector2(Screen.width * 0.5f, Screen.height * 0.5f);
+            Vector2 gui;
+            bool projected = TryProject(cam, centre, out gui);
+            if (projected && Vector2.Distance(gui, screenCentre) <= radius)
+            {
+                // 已经在圆圈里：收箭头，接下来该出现的是绿框
+                ArrowOff("inside the sight circle");
+                return;
+            }
+
+            Vector2 dir;
+            if (projected)
+            {
+                dir = gui - screenCentre;
+                if (dir.sqrMagnitude < 0.0001f) dir = Vector2.up;
+                dir.Normalize();
+            }
+            else
+            {
+                // 在身后：投影不出来，用相机空间的左右/俯仰给方向，指到圆圈的左或右边缘
+                Vector3 local = cam.transform.InverseTransformDirection((centre - cam.transform.position).normalized);
+                dir = new Vector2(local.x >= 0f ? 1f : -1f, -Mathf.Clamp(local.y * 0.6f, -0.6f, 0.6f));
+                dir.Normalize();
+            }
+
+            arrowTip = screenCentre + dir * (radius * 0.86f);
+            arrowDir = dir;
+            arrowUnit = u;
+            arrowOn = true;
+            if (!wasOn)
+                Log("sight arrow on: " + SafeName(u) + " outside the sight circle, dir="
+                    + dir.x.ToString("0.00") + "," + dir.y.ToString("0.00"));
+        }
+
+        // 人形目标（步兵）：GHPC 自己的 Unit.Type 就分得出来。步兵不是一个能算提前量的装甲目标，
+        // 选目标的三条路都用它挡掉（1.11.1）：手动 Alt、报点自动锁、圆圈外箭头。
+        static bool IsHuman(GHPC.Unit u)
+        {
+            if (u == null) return false;
+            try { return u.Type == GHPC.UnitType.Infantry; }
+            catch { return false; }
         }
 
         static bool UnitAlive(GHPC.Unit u)
@@ -995,6 +1283,9 @@ namespace LeadIndicator
         void ApplyRange(GHPC.Weapons.FireControlSystem fcs, float distance)
         {
             if (!eAutoRange.Value || fcs == null) return;
+            // 报点自动锁期间连 TargetRange 也不写（1.10.0 用户要求「出框时不要自动测距、不要调整标尺」）。
+            // AutoRange 只有玩家自己按 Alt 锁目标时才生效。
+            if (autoLock) return;
             try
             {
                 float current = fcs.TargetRange;
@@ -1475,6 +1766,29 @@ namespace LeadIndicator
                 }
             }
 
+            // 报点箭头（1.11.0）：报点目标在炮镜圆圈外时，沿圆圈内侧画一个指向它的绿色箭头
+            if (arrowOn && eEnabled.Value && !GHPC.AarController.InAar
+                && (Event.current == null || Event.current.type == EventType.Repaint))
+            {
+                EnsureTextures();
+                float scale = Mathf.Clamp(Screen.height / 1080f, 0.75f, 2f);
+                var green = new Color(0.25f, 1f, 0.35f, 0.95f);
+                // 1.11.0：箭头默认加粗（原来 2.5*scale，1080p 下只有 2~3 px，实战里远看几乎是一根细线）；
+                // 粗细还能在配置里改（SightArrowThickness，默认 5.5）
+                float width = 5.5f;
+                try { width = eSightWidth.Value; } catch { }
+                if (width <= 0f || width > 40f) width = 5.5f;
+                float thickness = Mathf.Max(2f, width * scale);
+                float len = Mathf.Max(24f, 28f * scale);
+                float halfWidth = len * 0.55f;
+                var perp = new Vector2(-arrowDir.y, arrowDir.x);
+                var back = arrowTip - arrowDir * len;
+                // 箭头尖落在圆圈内侧、朝外指：两条斜边是箭头，后面再补一小段杆
+                DrawLine(arrowTip, back + perp * halfWidth, thickness, green);
+                DrawLine(arrowTip, back - perp * halfWidth, thickness, green);
+                DrawLine(back - arrowDir * (len * 0.9f), back, thickness, green);
+            }
+
             GUI.matrix = matrix;
         }
 
@@ -1590,7 +1904,9 @@ namespace LeadIndicator
         {
             Release("scene loaded: " + sceneName);
             // timeSinceLevelLoad 换了任务会从头计，下一次读报点表必须立刻放行
+            ClearSpotHold("scene loaded: " + sceneName);
             ResetAutoSpot();
+            ArrowOff("scene loaded");
             targetRenderers = null;
             targetColliders = null;
             boxFrame = null;
